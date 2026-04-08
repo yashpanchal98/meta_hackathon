@@ -171,7 +171,7 @@ def run_llm_inference(hf_token: str, model_id: str, task: str) -> str:
 # Build Gradio UI
 # ---------------------------------------------------------------------------
 
-with gr.Blocks(title="OpenEnv Benchmark", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="OpenEnv Benchmark") as demo:
     gr.Markdown(
         """
 # OpenEnv Benchmark — Real-World Agent Evaluation
@@ -242,7 +242,7 @@ Three tasks of increasing difficulty to evaluate AI agent capabilities.
         )
         with gr.Row():
             with gr.Column():
-                gr.Code(value=PR_DIFF, language="diff", label="PR Diff", lines=40)
+                gr.Textbox(value=PR_DIFF, label="PR Diff", lines=40, interactive=False)
             with gr.Column():
                 cr_input = gr.Code(
                     label="Action (JSON)",
@@ -288,4 +288,4 @@ Three tasks of increasing difficulty to evaluate AI agent capabilities.
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=gr.themes.Soft())
