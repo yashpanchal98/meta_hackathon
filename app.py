@@ -141,17 +141,6 @@ def run_llm_inference(api_token: str, base_url: str, model_id: str, task: str) -
         return "Please enter your API token."
     if not base_url.strip():
         return "Please enter a base URL."
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return "openai package not available."
-
-    from inference import (
-        run_email_triage as _et,
-        run_data_cleaning as _dc,
-        run_code_review as _cr,
-    )
-
     import os, subprocess, sys
     env = os.environ.copy()
     env["HF_TOKEN"]     = api_token.strip()
