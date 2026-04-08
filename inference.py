@@ -1,297 +1,196 @@
 """
-Baseline inference script
-=========================
-Runs an LLM (via OpenAI-compatible API) through all three environment tasks
-and prints final scores.
-
-Usage::
-
-    HF_TOKEN=hf_xxx python inference.py [--model <model-id>] [--base-url <url>]
+OpenEnv Hackathon — Inference Script
+=====================================
+Runs three tasks (email_triage, data_cleaning, code_review) through an LLM
+and emits the required [START] / [STEP] / [END] log lines to stdout.
 
 Environment variables:
-    HF_TOKEN       Hugging Face API token (required)
-    HF_BASE_URL    Override inference endpoint (optional)
-    MODEL_ID       Override model ID (optional)
-
-Default endpoint: https://api-inference.huggingface.co/v1
-Default model:    meta-llama/Meta-Llama-3.1-8B-Instruct
+    API_BASE_URL   LLM endpoint  (default: https://router.huggingface.co/v1)
+    MODEL_NAME     Model ID      (default: Qwen/Qwen2.5-7B-Instruct)
+    HF_TOKEN       API key       (required, no default)
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
 import textwrap
 from typing import Any
 
-try:
-    from openai import OpenAI
-except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai")
-    sys.exit(1)
+from openai import OpenAI
 
 from environment import OpenEnvEnvironment, Action, TaskName
 
+# ---------------------------------------------------------------------------
+# Environment variables (hackathon-required names)
+# ---------------------------------------------------------------------------
 
-DEFAULT_BASE_URL = "https://router.huggingface.co/v1"
-DEFAULT_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")
 
-BENCHMARK_MODELS = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "Qwen/Qwen2.5-7B-Instruct",
-    "Qwen/Qwen2.5-Coder-7B-Instruct",
-]
+if HF_TOKEN is None:
+    raise ValueError("HF_TOKEN environment variable is required")
+
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+ENV_NAME = "openenv"
 
 # ---------------------------------------------------------------------------
-# Task-specific system prompts & action parsers
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def log_start(task: str) -> None:
+    print(f"[START] task={task} env={ENV_NAME} model={MODEL_NAME}", flush=True)
+
+def log_step(step: int, action: Any, reward: float, done: bool, error: str | None) -> None:
+    action_str = json.dumps(action, separators=(",", ":")) if not isinstance(action, str) else action
+    # Flatten to single line — no embedded newlines allowed
+    action_str = action_str.replace("\n", " ")
+    err_str = error if error else "null"
+    done_str = "true" if done else "false"
+    print(
+        f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_str} error={err_str}",
+        flush=True,
+    )
+
+def log_end(success: bool, steps: int, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    success_str = "true" if success else "false"
+    print(f"[END] success={success_str} steps={steps} rewards={rewards_str}", flush=True)
+
+# ---------------------------------------------------------------------------
+# JSON parser — grabs the first complete JSON object, ignores trailing text
+# ---------------------------------------------------------------------------
+
+def parse_json_response(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if "```" in text:
+        text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```")).strip()
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found: {text[:200]!r}")
+    obj, _ = json.JSONDecoder().raw_decode(text, start)
+    return obj
+
+# ---------------------------------------------------------------------------
+# System prompts
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPTS: dict[str, str] = {
     "email_triage": textwrap.dedent("""\
         You are an email triage assistant.
-        You will receive a list of emails. Classify each one with:
+        Classify each email with:
           - priority: "urgent" | "normal" | "low"
           - category: "action_required" | "fyi" | "spam" | "newsletter"
 
         Respond ONLY with a valid JSON object in this exact format:
-        {
-          "classifications": [
-            {"email_id": "e01", "priority": "urgent", "category": "action_required"},
-            ...
-          ]
-        }
+        {"classifications": [{"email_id": "e01", "priority": "urgent", "category": "action_required"}, ...]}
         No explanation. No markdown. Just the JSON.
     """),
 
     "data_cleaning": textwrap.dedent("""\
-        You are a data engineer. You will receive a dirty CSV and must clean it
-        by submitting operations one at a time.
+        You are a data engineer fixing a dirty CSV. Submit one operation per turn.
 
-        Available operations (respond with ONE JSON object per turn):
+        Operations (ONE JSON object per response, no other text):
           {"operation": "drop_duplicates"}
-          {"operation": "fill_nulls",    "column": "<col>", "value": "<val>"}
-          {"operation": "fix_type",      "column": "<col>", "transform": "strip_dollar"|"to_int"}
-          {"operation": "normalize_case","column": "<col>", "case": "lower"|"upper"|"title"}
-          {"operation": "drop_outliers", "column": "<col>", "min": <num>, "max": <num>}
-          {"operation": "submit"}   <- use this as your LAST operation
+          {"operation": "fill_nulls",     "column": "<col>", "value": "<val>"}
+          {"operation": "fix_type",       "column": "<col>", "transform": "strip_dollar"|"to_int"}
+          {"operation": "normalize_case", "column": "<col>", "case": "lower"}
+          {"operation": "drop_outliers",  "column": "<col>", "min": <n>, "max": <n>}
+          {"operation": "submit"}
 
-        Respond ONLY with a single JSON object. No explanation. No markdown.
+        Use "submit" as your final operation. ONE JSON object only.
     """),
 
     "code_review": textwrap.dedent("""\
-        You are a security-focused code reviewer.
-        You will review a pull request diff. There are exactly 5 bugs seeded (B1-B5).
+        You are a security-focused code reviewer. There are exactly 5 bugs (B1-B5).
 
-        Each turn you must output EXACTLY ONE JSON object — nothing else.
-        No prose, no markdown, no code fences, no extra keys.
+        Each turn: output EXACTLY ONE JSON object, nothing else — no prose, no markdown.
 
-        Actions you can take (one per turn):
-          Inspect a file:  {"action": "inspect", "file": "app/db.py"}
-          Report a bug:    {"action": "report_bug", "bug_id": "B1", "line": 8, "description": "SQL injection via f-string interpolation", "fix": "Use parameterised query with ? placeholder"}
-          Finish:          {"action": "submit"}
+        Actions:
+          {"action": "inspect", "file": "app/db.py"}
+          {"action": "report_bug", "bug_id": "B1", "line": 8, "description": "<desc>", "fix": "<fix>"}
+          {"action": "submit"}
 
         Strategy:
-        1. First output: {"action": "inspect", "file": "app/db.py"}
-        2. Then report each bug one at a time using report_bug.
-        3. After reporting all 5 bugs, output: {"action": "submit"}
+        1. Inspect files one at a time.
+        2. Report each bug with report_bug (one per turn).
+        3. After all 5 bugs reported, output {"action": "submit"}.
 
-        Use bug IDs B1 through B5 exactly.
-        ONE JSON object per response. No other text whatsoever.
+        ONE JSON object per response. No other text.
     """),
 }
 
-
-def parse_json_response(text: str) -> dict[str, Any]:
-    """Extract the first complete JSON object from model output."""
-    text = text.strip()
-    # Strip markdown code fences if present
-    if "```" in text:
-        lines = text.split("\n")
-        text = "\n".join(
-            l for l in lines if not l.strip().startswith("```")
-        ).strip()
-    start = text.find("{")
-    if start == -1:
-        raise ValueError(f"No JSON object found in response: {text[:200]!r}")
-    # Use raw_decode so we read exactly the first valid JSON object,
-    # ignoring any trailing text or second JSON blob the model appended.
-    obj, _ = json.JSONDecoder().raw_decode(text, start)
-    return obj
-
-
 # ---------------------------------------------------------------------------
-# Per-task runners
+# Per-task episode runners
 # ---------------------------------------------------------------------------
 
-def run_email_triage(client: OpenAI, model: str) -> float:
-    env = OpenEnvEnvironment(TaskName.EMAIL_TRIAGE)
+def run_episode(task_name: TaskName, max_turns: int) -> None:
+    task_str = task_name.value
+    log_start(task_str)
+
+    env = OpenEnvEnvironment(task_name)
     obs = env.reset()
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPTS["email_triage"]},
-        {"role": "user", "content": obs.content},
+        {"role": "system", "content": SYSTEM_PROMPTS[task_str]},
+        {"role": "user",   "content": obs.content},
     ]
-    response = client.chat.completions.create(model=model, messages=messages, temperature=0)
-    raw = response.choices[0].message.content or ""
+
+    step       = 0
+    rewards:   list[float] = []
+    last_error: str | None = None
+    success    = False
 
     try:
-        payload = parse_json_response(raw)
-    except ValueError as e:
-        print(f"  [email_triage] Parse error: {e}")
-        payload = {"classifications": []}
+        for _ in range(max_turns):
+            response = client.chat.completions.create(
+                model=MODEL_NAME, messages=messages, temperature=0
+            )
+            raw = response.choices[0].message.content or ""
+            messages.append({"role": "assistant", "content": raw})
 
-    action = Action(task=TaskName.EMAIL_TRIAGE, payload=payload)
-    result = env.step(action)
-    score = result.info.get("cumulative_reward", result.reward.value)
-    print(f"  [email_triage] Score: {score:.4f} | {result.reward.message[:120]}")
-    return score
+            last_error = None
+            try:
+                payload = parse_json_response(raw)
+            except ValueError as e:
+                last_error = str(e)[:120]
+                # Force close the episode gracefully on parse failure
+                payload = {"operation": "submit"} if task_str == "data_cleaning" else {"action": "submit"}
 
+            action = Action(task=task_name, payload=payload)
+            result = env.step(action)
+            step += 1
+            reward = result.reward.value
+            rewards.append(reward)
 
-def run_data_cleaning(client: OpenAI, model: str, max_turns: int = 10) -> float:
-    env = OpenEnvEnvironment(TaskName.DATA_CLEANING)
-    obs = env.reset()
+            log_step(step, payload, reward, result.done, last_error)
+            messages.append({"role": "user", "content": result.observation.content})
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPTS["data_cleaning"]},
-        {"role": "user", "content": obs.content},
-    ]
+            if result.done:
+                success = reward > 0
+                break
 
-    final_score = 0.0
-    for turn in range(max_turns):
-        response = client.chat.completions.create(model=model, messages=messages, temperature=0)
-        raw = response.choices[0].message.content or ""
-        messages.append({"role": "assistant", "content": raw})
-
-        try:
-            payload = parse_json_response(raw)
-        except ValueError as e:
-            print(f"  [data_cleaning] Turn {turn+1} parse error: {e}")
-            payload = {"operation": "submit"}
-
-        action = Action(task=TaskName.DATA_CLEANING, payload=payload)
-        result = env.step(action)
-        messages.append({"role": "user", "content": result.observation.content})
-
-        if result.done:
-            final_score = result.info.get("cumulative_reward", result.reward.value)
-            print(f"  [data_cleaning] Score: {final_score:.4f} | {result.reward.message[:120]}")
-            break
-
-    return final_score
-
-
-def run_code_review(client: OpenAI, model: str, max_turns: int = 15) -> float:
-    env = OpenEnvEnvironment(TaskName.CODE_REVIEW)
-    obs = env.reset()
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPTS["code_review"]},
-        {"role": "user", "content": obs.content},
-    ]
-
-    final_score = 0.0
-    for turn in range(max_turns):
-        response = client.chat.completions.create(model=model, messages=messages, temperature=0)
-        raw = response.choices[0].message.content or ""
-        messages.append({"role": "assistant", "content": raw})
-
-        try:
-            payload = parse_json_response(raw)
-        except ValueError as e:
-            print(f"  [code_review] Turn {turn+1} parse error: {e}")
-            payload = {"action": "submit"}
-
-        action = Action(task=TaskName.CODE_REVIEW, payload=payload)
-        result = env.step(action)
-        messages.append({"role": "user", "content": result.observation.content})
-
-        if result.done:
-            final_score = result.info.get("cumulative_reward", result.reward.value)
-            print(f"  [code_review] Score: {final_score:.4f} | {result.reward.message[:120]}")
-            break
-
-    return final_score
+    except Exception as exc:
+        last_error = str(exc)[:120]
+        log_step(step + 1, "exception", 0.0, True, last_error)
+    finally:
+        log_end(success, step, rewards)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-RUNNERS = {
-    "email_triage": run_email_triage,
-    "data_cleaning": run_data_cleaning,
-    "code_review": run_code_review,
-}
-
-
-def run_model(client: OpenAI, model: str) -> dict[str, float]:
-    """Run all tasks for a single model and return scores."""
-    scores: dict[str, float] = {}
-    for task_name, runner in RUNNERS.items():
-        print(f"  [{task_name}]")
-        try:
-            scores[task_name] = runner(client, model)
-        except Exception as exc:
-            print(f"  ERROR: {exc}")
-            scores[task_name] = 0.0
-    return scores
-
-
-def print_leaderboard(results: dict[str, dict[str, float]]) -> None:
-    tasks = list(RUNNERS.keys())
-    col_w = 22
-
-    header = f"  {'Model':<40}" + "".join(f"{t:<{col_w}}" for t in tasks) + f"{'AVERAGE':<12}"
-    print("\n" + "=" * len(header))
-    print("BENCHMARK LEADERBOARD")
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
-
-    ranked = sorted(
-        results.items(),
-        key=lambda kv: sum(kv[1].values()) / len(kv[1]),
-        reverse=True,
-    )
-    for model, scores in ranked:
-        avg = sum(scores.values()) / len(scores)
-        short = model.split("/")[-1][:38]
-        row = f"  {short:<40}" + "".join(f"{scores.get(t, 0):<{col_w}.4f}" for t in tasks) + f"{avg:<12.4f}"
-        print(row)
-
-    print("=" * len(header))
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="OpenEnv baseline inference script")
-    parser.add_argument(
-        "--models", nargs="+",
-        default=BENCHMARK_MODELS,
-        help="List of model IDs to benchmark (default: 3 preset models)",
-    )
-    parser.add_argument("--base-url", default=os.getenv("HF_BASE_URL", DEFAULT_BASE_URL))
-    args = parser.parse_args()
-
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        print("ERROR: HF_TOKEN environment variable not set.")
-        sys.exit(1)
-
-    client = OpenAI(api_key=hf_token, base_url=args.base_url)
-    print(f"API URL : {args.base_url}")
-    print(f"Models  : {args.models}")
-    print("=" * 60)
-
-    all_results: dict[str, dict[str, float]] = {}
-    for model in args.models:
-        print(f"\nBenchmarking: {model}")
-        print("-" * 60)
-        all_results[model] = run_model(client, model)
-
-    print_leaderboard(all_results)
-
+TASKS = [
+    (TaskName.EMAIL_TRIAGE,  1),
+    (TaskName.DATA_CLEANING, 10),
+    (TaskName.CODE_REVIEW,   15),
+]
 
 if __name__ == "__main__":
-    main()
+    for task_name, max_turns in TASKS:
+        run_episode(task_name, max_turns)
+        print(flush=True)  # blank line between tasks

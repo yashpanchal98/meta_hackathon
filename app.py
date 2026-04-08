@@ -152,18 +152,22 @@ def run_llm_inference(api_token: str, base_url: str, model_id: str, task: str) -
         run_code_review as _cr,
     )
 
-    client = OpenAI(api_key=api_token.strip(), base_url=base_url.strip())
-    task_map = {
-        "email_triage": _et,
-        "data_cleaning": _dc,
-        "code_review": _cr,
-    }
-    runner = task_map.get(task)
-    if runner is None:
-        return f"Unknown task: {task}"
+    import os, subprocess, sys
+    env = os.environ.copy()
+    env["HF_TOKEN"]     = api_token.strip()
+    env["API_BASE_URL"] = base_url.strip()
+    env["MODEL_NAME"]   = model_id.strip()
+    # Only run the selected task by temporarily patching TASKS via env
+    env["OPENENV_TASK"] = task
     try:
-        score = runner(client, model_id.strip())
-        return f"**Task:** {task}\n**Model:** {model_id}\n**Score:** `{score:.4f}`"
+        result = subprocess.run(
+            [sys.executable, "inference_single.py"],
+            capture_output=True, text=True, timeout=120, env=env
+        )
+        output = result.stdout or result.stderr or "No output."
+        return f"```\n{output}\n```"
+    except subprocess.TimeoutExpired:
+        return "Timed out after 120 seconds."
     except Exception as e:
         return f"Error: {e}"
 
