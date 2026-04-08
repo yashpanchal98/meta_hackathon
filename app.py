@@ -335,10 +335,17 @@ Three tasks of increasing difficulty. REST API available at `/reset`, `/step`, `
     gr.Markdown("---\n**Tags:** `openenv` · `agent-eval` · `code-review` · `data-cleaning` | Built for META Hackathon.")
 
 # ---------------------------------------------------------------------------
-# Mount Gradio onto FastAPI — FastAPI routes take priority over Gradio catch-all
+# Mount Gradio at /ui so FastAPI routes at /reset /step /health are unobstructed
 # ---------------------------------------------------------------------------
 
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
+
+
+@fastapi_app.get("/")
+def root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/ui")
+
 
 if __name__ == "__main__":
     import uvicorn
