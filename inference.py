@@ -82,34 +82,43 @@ SYSTEM_PROMPTS: dict[str, str] = {
 
     "code_review": textwrap.dedent("""\
         You are a security-focused code reviewer.
-        You will review a pull request diff. There are exactly 5 bugs seeded.
+        You will review a pull request diff. There are exactly 5 bugs seeded (B1-B5).
 
-        Available actions (respond with ONE JSON object per turn):
-          {"action": "inspect", "file": "<path>"}
-          {"action": "report_bug", "bug_id": "B1", "line": <n>,
-           "description": "<desc>", "fix": "<fix>"}
-          {"action": "submit"}   <- use when you have reported all bugs
+        Each turn you must output EXACTLY ONE JSON object — nothing else.
+        No prose, no markdown, no code fences, no extra keys.
 
-        Bug IDs to use: B1, B2, B3, B4, B5 (in any order).
-        Respond ONLY with a single JSON object. No explanation. No markdown.
+        Actions you can take (one per turn):
+          Inspect a file:  {"action": "inspect", "file": "app/db.py"}
+          Report a bug:    {"action": "report_bug", "bug_id": "B1", "line": 8, "description": "SQL injection via f-string interpolation", "fix": "Use parameterised query with ? placeholder"}
+          Finish:          {"action": "submit"}
+
+        Strategy:
+        1. First output: {"action": "inspect", "file": "app/db.py"}
+        2. Then report each bug one at a time using report_bug.
+        3. After reporting all 5 bugs, output: {"action": "submit"}
+
+        Use bug IDs B1 through B5 exactly.
+        ONE JSON object per response. No other text whatsoever.
     """),
 }
 
 
 def parse_json_response(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from model output."""
+    """Extract the first complete JSON object from model output."""
     text = text.strip()
     # Strip markdown code fences if present
-    if text.startswith("```"):
+    if "```" in text:
         lines = text.split("\n")
         text = "\n".join(
             l for l in lines if not l.strip().startswith("```")
         ).strip()
     start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    if start == -1:
         raise ValueError(f"No JSON object found in response: {text[:200]!r}")
-    return json.loads(text[start:end])
+    # Use raw_decode so we read exactly the first valid JSON object,
+    # ignoring any trailing text or second JSON blob the model appended.
+    obj, _ = json.JSONDecoder().raw_decode(text, start)
+    return obj
 
 
 # ---------------------------------------------------------------------------
