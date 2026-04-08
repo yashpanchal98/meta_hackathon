@@ -136,9 +136,11 @@ def step_code_review(action_json: str) -> tuple[str, str]:
 # LLM Inference (optional — requires HF_TOKEN)
 # ---------------------------------------------------------------------------
 
-def run_llm_inference(hf_token: str, model_id: str, task: str) -> str:
-    if not hf_token.strip():
-        return "Please enter your HF token."
+def run_llm_inference(api_token: str, base_url: str, model_id: str, task: str) -> str:
+    if not api_token.strip():
+        return "Please enter your API token."
+    if not base_url.strip():
+        return "Please enter a base URL."
     try:
         from openai import OpenAI
     except ImportError:
@@ -148,10 +150,9 @@ def run_llm_inference(hf_token: str, model_id: str, task: str) -> str:
         run_email_triage as _et,
         run_data_cleaning as _dc,
         run_code_review as _cr,
-        SYSTEM_PROMPTS,
     )
 
-    client = OpenAI(api_key=hf_token.strip(), base_url="https://router.huggingface.co/v1")
+    client = OpenAI(api_key=api_token.strip(), base_url=base_url.strip())
     task_map = {
         "email_triage": _et,
         "data_cleaning": _dc,
@@ -261,24 +262,38 @@ Three tasks of increasing difficulty to evaluate AI agent capabilities.
     # ------------------------------------------------------------------
     with gr.Tab("Run LLM Inference"):
         gr.Markdown(
-            "Plug in any HF-compatible model to run the full benchmark automatically. "
-            "Requires a [Hugging Face token](https://huggingface.co/settings/tokens)."
+            "Plug in any OpenAI-compatible API to run the benchmark automatically.\n\n"
+            "| Provider | Base URL | Free? |\n"
+            "|---|---|---|\n"
+            "| **Groq** | `https://api.groq.com/openai/v1` | Yes |\n"
+            "| **Together AI** | `https://api.together.xyz/v1` | Trial credits |\n"
+            "| **HF Router** | `https://router.huggingface.co/v1` | Limited free tier |\n"
+            "| **OpenAI** | `https://api.openai.com/v1` | Paid |\n"
         )
         with gr.Row():
-            llm_token = gr.Textbox(label="HF Token", type="password", placeholder="hf_...")
+            llm_token = gr.Textbox(label="API Token", type="password", placeholder="your token...")
+            llm_base_url = gr.Textbox(
+                label="Base URL",
+                value="https://api.groq.com/openai/v1",
+                placeholder="https://api.groq.com/openai/v1",
+            )
+        with gr.Row():
             llm_model = gr.Textbox(
                 label="Model ID",
-                value="Qwen/Qwen2.5-7B-Instruct",
-                placeholder="org/model-name",
+                value="llama-3.1-8b-instant",
+                placeholder="model name for chosen provider",
             )
             llm_task = gr.Dropdown(
                 choices=["email_triage", "data_cleaning", "code_review"],
                 value="email_triage",
                 label="Task",
             )
+        gr.Markdown(
+            "**Groq model names:** `llama-3.1-8b-instant` · `llama-3.3-70b-versatile` · `gemma2-9b-it` · `mixtral-8x7b-32768`"
+        )
         llm_btn = gr.Button("Run Benchmark", variant="primary")
         llm_output = gr.Markdown(label="Result")
-        llm_btn.click(run_llm_inference, inputs=[llm_token, llm_model, llm_task], outputs=llm_output)
+        llm_btn.click(run_llm_inference, inputs=[llm_token, llm_base_url, llm_model, llm_task], outputs=llm_output)
 
     # ------------------------------------------------------------------
     gr.Markdown(
